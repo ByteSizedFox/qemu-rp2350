@@ -31,6 +31,7 @@
 #include "target/arm/tcg/idau.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "qom/object.h"
 
@@ -38,7 +39,7 @@
 #define RP2350_ROM_BASE     0x00000000u
 #define RP2350_ROM_SIZE     (32u * KiB)
 #define RP2350_FLASH_BASE   0x10000000u
-#define RP2350_FLASH_SIZE   (32u * MiB)
+#define RP2350_FLASH_SIZE   (4u * MiB)   /* Pico 2 default; override with flash-size= */
 #define RP2350_SRAM_BASE    0x20000000u
 #define RP2350_SRAM_SIZE    (520u * KiB)    /* 8×64KB + 2×4KB scratch */
 
@@ -205,6 +206,10 @@ struct RP2350MachineState {
     uint32_t usb_intr;
     qemu_irq usb_irq;
     QEMUTimer *usb_timer;
+
+    /* Persistent flash backing file (set via -machine rp2350,flash=path) */
+    char    *flash_file;
+    Notifier flash_save_notifier;
 };
 
 /* --------------------------------------------------------------------------
@@ -1566,6 +1571,36 @@ static const MemoryRegionOps usb_reg_ops = {
 };
 
 /* --------------------------------------------------------------------------
+ * Flash persistence
+ *
+ * On QEMU exit, write the entire flash RAM back to the backing file so that
+ * littlefs data, MicroPython frozen modules, etc. survive across runs.
+ * -------------------------------------------------------------------------- */
+static void rp2350_flash_save(Notifier *notifier, void *data)
+{
+    RP2350MachineState *s =
+        container_of(notifier, RP2350MachineState, flash_save_notifier);
+    const char *path = s->flash_file;
+    FILE *f;
+    void *ptr;
+
+    if (!path) {
+        return;
+    }
+    ptr = memory_region_get_ram_ptr(&s->flash);
+    f = fopen(path, "wb");
+    if (!f) {
+        warn_report("rp2350: could not save flash to '%s': %s",
+                    path, strerror(errno));
+        return;
+    }
+    if (fwrite(ptr, 1, RP2350_FLASH_SIZE, f) != RP2350_FLASH_SIZE) {
+        warn_report("rp2350: short write saving flash to '%s'", path);
+    }
+    fclose(f);
+}
+
+/* --------------------------------------------------------------------------
  * Machine initialisation
  * -------------------------------------------------------------------------- */
 static void rp2350_init(MachineState *machine)
@@ -1598,10 +1633,32 @@ static void rp2350_init(MachineState *machine)
         }
     }
 
-    /* --- Flash (XIP, read-only for CPU) at 0x10000000 and aliases --- */
-    memory_region_init_rom(&s->flash, NULL, "rp2350.flash",
+    /* --- Flash (XIP, writable RAM) at 0x10000000 and aliases ---
+     *
+     * Flash is a writable RAM region so that MicroPython's littlefs and other
+     * firmware-managed storage survive.  If -machine rp2350,flash=<path> is
+     * given, the image is loaded at startup (preserving any existing filesystem
+     * data at the end of flash) and written back on exit.  The -kernel binary
+     * is then stamped into offset 0, exactly as picotool would do when flashing
+     * a Pico without erasing first.
+     */
+    memory_region_init_ram(&s->flash, NULL, "rp2350.flash",
                            RP2350_FLASH_SIZE, &error_fatal);
     memory_region_add_subregion(sys_mem, RP2350_FLASH_BASE, &s->flash);
+
+    if (s->flash_file) {
+        /* Load existing flash image (non-fatal if the file doesn't exist yet) */
+        ssize_t sz = load_image_targphys(s->flash_file,
+                                         RP2350_FLASH_BASE, RP2350_FLASH_SIZE,
+                                         NULL);
+        if (sz < 0) {
+            /* File not found — flash initialised to zero, will be created on exit */
+            memset(memory_region_get_ram_ptr(&s->flash), 0xff, RP2350_FLASH_SIZE);
+        }
+        /* Register exit notifier to persist the flash image on shutdown */
+        s->flash_save_notifier.notify = rp2350_flash_save;
+        qemu_add_exit_notifier(&s->flash_save_notifier);
+    }
 
     /* Map common aliases used by SDK/bootrom */
     for (i = 1; i < 4; i++) {
@@ -1785,6 +1842,19 @@ static void rp2350_init(MachineState *machine)
     }
 }
 
+static char *rp2350_get_flash_file(Object *obj, Error **errp)
+{
+    RP2350MachineState *s = RP2350_MACHINE(obj);
+    return g_strdup(s->flash_file);
+}
+
+static void rp2350_set_flash_file(Object *obj, const char *value, Error **errp)
+{
+    RP2350MachineState *s = RP2350_MACHINE(obj);
+    g_free(s->flash_file);
+    s->flash_file = g_strdup(value);
+}
+
 static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
 {
     IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(oc);
@@ -1806,6 +1876,22 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
      * flash (init-svtor = 0x10000000) so Pico SDK programs work, but
      * ROM helper functions (floating-point, USB) won't be available.
      */
+
+    /*
+     * flash=<path>  — persistent 4 MB flash backing file.
+     *
+     * The file is loaded at startup (0xFF-filled if it doesn't exist yet).
+     * The -kernel binary is then stamped into offset 0, just like picotool
+     * flashing without erasing, so any littlefs data beyond the firmware
+     * survives across runs.  On exit the whole region is written back.
+     *
+     * Example: -machine rp2350,flash=pico2.bin -kernel firmware.bin
+     */
+    object_class_property_add_str(oc, "flash",
+                                  rp2350_get_flash_file,
+                                  rp2350_set_flash_file);
+    object_class_property_set_description(oc, "flash",
+        "Path to 4 MiB flash backing file (preserves littlefs across runs)");
 }
 
 static const InterfaceInfo rp2350_machine_interfaces[] = {
@@ -1816,11 +1902,11 @@ static const InterfaceInfo rp2350_machine_interfaces[] = {
 };
 
 static const TypeInfo rp2350_machine_typeinfo = {
-    .name       = TYPE_RP2350_MACHINE,
-    .parent     = TYPE_MACHINE,
-    .instance_size = sizeof(RP2350MachineState),
-    .class_init = rp2350_machine_class_init,
-    .interfaces = rp2350_machine_interfaces,
+    .name           = TYPE_RP2350_MACHINE,
+    .parent         = TYPE_MACHINE,
+    .instance_size  = sizeof(RP2350MachineState),
+    .class_init     = rp2350_machine_class_init,
+    .interfaces     = rp2350_machine_interfaces,
 };
 
 static void rp2350_machine_register(void)
