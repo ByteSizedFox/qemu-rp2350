@@ -35,6 +35,14 @@
 #include "system/system.h"
 #include "qom/object.h"
 
+/* UF2 file format constants */
+#define UF2_MAGIC0           0x0A324655u   /* "UF2\n" */
+#define UF2_MAGIC1           0x9E5D5157u
+#define UF2_MAGIC_END        0x0AB16F30u
+#define UF2_FLAG_NOFLASH     0x00000001u   /* block should not be flashed */
+#define UF2_FLAG_FILE_CONT   0x00001000u   /* file-container block, not data */
+#define UF2_BLOCK_SIZE       512u
+
 /* RP2350 memory map */
 #define RP2350_ROM_BASE     0x00000000u
 #define RP2350_ROM_SIZE     (32u * KiB)
@@ -1705,6 +1713,92 @@ static void rp2350_flash_save(Notifier *notifier, void *data)
 }
 
 /* --------------------------------------------------------------------------
+ * UF2 loader
+ *
+ * Parses a UF2 file and copies each data block into the flash RAM region.
+ * Blocks that target addresses outside [FLASH_BASE, FLASH_BASE+FLASH_SIZE)
+ * are silently skipped (e.g. blocks targeting SRAM or OTP).
+ *
+ * Returns the number of flash blocks loaded, or 0 on failure.
+ * -------------------------------------------------------------------------- */
+static int rp2350_load_uf2(RP2350MachineState *s, const char *filename)
+{
+    FILE *f;
+    uint8_t blk[UF2_BLOCK_SIZE];
+    uint8_t *flash_ptr = memory_region_get_ram_ptr(&s->flash);
+    int n = 0;
+
+    f = fopen(filename, "rb");
+    if (!f) {
+        return 0;
+    }
+
+    while (fread(blk, 1, UF2_BLOCK_SIZE, f) == UF2_BLOCK_SIZE) {
+        /* Read fields (little-endian) */
+        uint32_t m0    = (uint32_t)blk[0]  | ((uint32_t)blk[1]  << 8)
+                       | ((uint32_t)blk[2]  << 16) | ((uint32_t)blk[3]  << 24);
+        uint32_t m1    = (uint32_t)blk[4]  | ((uint32_t)blk[5]  << 8)
+                       | ((uint32_t)blk[6]  << 16) | ((uint32_t)blk[7]  << 24);
+        uint32_t flags = (uint32_t)blk[8]  | ((uint32_t)blk[9]  << 8)
+                       | ((uint32_t)blk[10] << 16) | ((uint32_t)blk[11] << 24);
+        uint32_t addr  = (uint32_t)blk[12] | ((uint32_t)blk[13] << 8)
+                       | ((uint32_t)blk[14] << 16) | ((uint32_t)blk[15] << 24);
+        uint32_t psz   = (uint32_t)blk[16] | ((uint32_t)blk[17] << 8)
+                       | ((uint32_t)blk[18] << 16) | ((uint32_t)blk[19] << 24);
+        uint32_t mend  = (uint32_t)blk[508] | ((uint32_t)blk[509] << 8)
+                       | ((uint32_t)blk[510] << 16) | ((uint32_t)blk[511] << 24);
+
+        /* Validate magic */
+        if (m0 != UF2_MAGIC0 || m1 != UF2_MAGIC1 || mend != UF2_MAGIC_END) {
+            continue;
+        }
+        /* Skip non-data blocks */
+        if (flags & (UF2_FLAG_NOFLASH | UF2_FLAG_FILE_CONT)) {
+            continue;
+        }
+        /* Sanity-check payload size (data field is 476 bytes) */
+        if (psz == 0 || psz > 476) {
+            continue;
+        }
+        /* Only load blocks that fall inside XIP flash */
+        if (addr < RP2350_FLASH_BASE
+            || (uint64_t)addr + psz > (uint64_t)RP2350_FLASH_BASE + RP2350_FLASH_SIZE) {
+            continue;
+        }
+
+        memcpy(flash_ptr + (addr - RP2350_FLASH_BASE), blk + 32, psz);
+        n++;
+    }
+
+    fclose(f);
+    return n;
+}
+
+/*
+ * Probe the first 8 bytes of a file for UF2 magic numbers.
+ * Returns true if the file looks like a UF2 image.
+ */
+static bool rp2350_is_uf2(const char *filename)
+{
+    FILE *f = fopen(filename, "rb");
+    uint8_t hdr[8];
+    bool ok = false;
+
+    if (!f) {
+        return false;
+    }
+    if (fread(hdr, 1, 8, f) == 8) {
+        uint32_t m0 = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8)
+                    | ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+        uint32_t m1 = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8)
+                    | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+        ok = (m0 == UF2_MAGIC0 && m1 == UF2_MAGIC1);
+    }
+    fclose(f);
+    return ok;
+}
+
+/* --------------------------------------------------------------------------
  * Machine initialisation
  * -------------------------------------------------------------------------- */
 static void rp2350_init(MachineState *machine)
@@ -1926,12 +2020,30 @@ static void rp2350_init(MachineState *machine)
                  serial_hd(1));
 
     /*
-     * Load the kernel; for a flat binary it lands at FLASH_BASE, for an ELF
-     * it loads to its linked addresses.  On reset, the CPU reads the vector
-     * table from SVTOR = FLASH_BASE.
+     * Load the kernel.
+     *
+     * UF2 files are detected by their magic bytes and parsed block-by-block
+     * into the flash RAM.  armv7m_load_kernel is then called with a NULL
+     * filename so it registers the armv7m_reset hook (which reads SP/PC from
+     * the vector table) without trying to re-load the file.
+     *
+     * Raw binaries and ELFs are passed through to armv7m_load_kernel as
+     * usual; they land at FLASH_BASE and the same reset hook applies.
      */
-    armv7m_load_kernel(s->cpu[0].cpu, machine->kernel_filename,
-                       RP2350_FLASH_BASE, RP2350_FLASH_SIZE);
+    if (machine->kernel_filename
+        && rp2350_is_uf2(machine->kernel_filename)) {
+        int blocks = rp2350_load_uf2(s, machine->kernel_filename);
+        if (blocks == 0) {
+            error_report("rp2350: failed to load UF2 kernel '%s'",
+                         machine->kernel_filename);
+            exit(1);
+        }
+        armv7m_load_kernel(s->cpu[0].cpu, NULL,
+                           RP2350_FLASH_BASE, RP2350_FLASH_SIZE);
+    } else {
+        armv7m_load_kernel(s->cpu[0].cpu, machine->kernel_filename,
+                           RP2350_FLASH_BASE, RP2350_FLASH_SIZE);
+    }
 
     /*
      * Register post-reset hooks AFTER armv7m_load_kernel, which itself
