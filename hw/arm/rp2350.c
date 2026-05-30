@@ -115,8 +115,8 @@
 #define SIO_FIFO_DEPTH      8
 
 /* IRQ numbers (NVIC lines, 0-based) */
-#define RP2350_UART0_IRQ    20
-#define RP2350_UART1_IRQ    21
+#define RP2350_UART0_IRQ    33   /* RP2350 UART0 IRQ (RP2040 had 20) */
+#define RP2350_UART1_IRQ    34
 #define RP2350_NUM_IRQS     52
 
 /* Default system clock: 125 MHz */
