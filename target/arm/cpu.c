@@ -146,7 +146,8 @@ static bool arm_cpu_has_work(CPUState *cs)
     ARMCPU *cpu = ARM_CPU(cs);
 
     if (arm_feature(&cpu->env, ARM_FEATURE_M)) {
-        if (cpu->env.event_register) {
+        /* PSCI_OFF means fully powered down: don't wake for SEV either */
+        if (cpu->env.event_register && cpu->power_state != PSCI_OFF) {
             return true;
         }
     }

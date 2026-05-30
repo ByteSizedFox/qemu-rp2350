@@ -23,10 +23,32 @@
 #include "target/arm/cpu.h"
 #include "target/arm/cpu-features.h"
 #include "exec/cputlb.h"
+#include "exec/cpu-common.h"
 #include "exec/memop.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
 #include "trace.h"
+
+/*
+ * On real ARM hardware a CPU lockup drives a fixed bus pattern forever until
+ * reset; the rest of the system keeps running.  QEMU can't model that
+ * precisely, so instead we halt the offending CPU and emit a warning.  This
+ * keeps secondary CPUs (e.g. RP2350 CPU1) from killing the whole emulator.
+ */
+G_NORETURN static void armv7m_nvic_cpu_lockup(NVICState *s, const char *reason)
+{
+    CPUState *cs = CPU(s->cpu);
+    ARMCPU *cpu = s->cpu;
+
+    warn_report("CPU%d lockup: %s -- halting CPU", cs->cpu_index, reason);
+    cpu->power_state = PSCI_OFF;
+    cpu->env.event_register = false;  /* prevent arm_cpu_has_work waking us */
+    cs->halted = 1;
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    cs->exception_index = EXCP_HALTED;
+    cpu_loop_exit(cs);
+}
 
 /* IRQ number counting:
  *
@@ -510,6 +532,14 @@ static void nvic_irq_update(NVICState *s)
      */
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
+    /* Diagnostic: log when USB IRQ (14, exc 30) is involved */
+    if (s->vectpending == 30 || s->vectors[30].pending || s->vectors[30].active) {
+        qemu_log("nvic_irq_update: vectpending=%d pend_prio=%d exc_prio=%d lvl=%d "
+                 "usb14: en=%d pend=%d act=%d lv=%d\n",
+                 s->vectpending, pend_prio, s->exception_prio, lvl,
+                 (int)s->vectors[30].enabled, (int)s->vectors[30].pending,
+                 (int)s->vectors[30].active, (int)s->vectors[30].level);
+    }
     qemu_set_irq(s->excpout, lvl);
 }
 
@@ -602,10 +632,7 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
              * which saves having to have an extra argument is_terminal
              * that we'd only use in one place.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't take terminal derived exception "
-                      "(original exception priority %d)\n",
-                      s->vectpending_prio);
+            armv7m_nvic_cpu_lockup(s, "can't take terminal derived exception");
         }
         /* We now continue with the same code as for a normal pending
          * exception, which will cause us to pend the derived exception.
@@ -654,6 +681,7 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
              * the target security state of the original exception; otherwise
              * we take a Secure HardFault.
              */
+            int orig_irq = irq;
             irq = ARMV7M_EXCP_HARD;
             if (arm_feature(&s->cpu->env, ARM_FEATURE_M_SECURITY) &&
                 (targets_secure ||
@@ -662,15 +690,17 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
             } else {
                 vec = &s->vectors[irq];
             }
+            qemu_log("nvic_escalate: orig_irq=%d->HardFault running=%d hf_prio=%d "
+                     "pc=0x%08x cfsr_s=0x%08x cfsr_ns=0x%08x\n", orig_irq, running, vec->prio,
+                     s->cpu->env.regs[15],
+                     s->cpu->env.v7m.cfsr[1], s->cpu->env.v7m.cfsr[0]);
             if (running <= vec->prio) {
                 /* We want to escalate to HardFault but we can't take the
                  * synchronous HardFault at this point either. This is a
                  * Lockup condition due to a guest bug. We don't model
                  * Lockup, so report via cpu_abort() instead.
                  */
-                cpu_abort(CPU(s->cpu),
-                          "Lockup: can't escalate %d to HardFault "
-                          "(current priority %d)\n", irq, running);
+                armv7m_nvic_cpu_lockup(s, "can't escalate to HardFault");
             }
 
             /* HF may be banked but there is only one shared HFSR */
@@ -766,9 +796,7 @@ void armv7m_nvic_set_pending_lazyfp(NVICState *s, int irq, bool secure)
              * We want to escalate to HardFault but the context the
              * FP state belongs to prevents the exception pre-empting.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't escalate to HardFault during "
-                      "lazy FP register stacking\n");
+            armv7m_nvic_cpu_lockup(s, "can't escalate to HardFault during lazy FP stacking");
         }
     }
 
@@ -1914,6 +1942,20 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             if (region >= cpu->pmsav7_dregion) {
                 return;
             }
+            /*
+             * RP2350 workaround: BOOTRAM (0x400E0000-0x400E03FF) Secure MPU
+             * regions are marked AP=2 (read-only) as a Core1 guard, but the
+             * Secure preboot stack overlaps this region on the first NSC call
+             * and must be writable.  Downgrade any read-only AP covering
+             * BOOTRAM to AP=0 (read/write any privilege) for Secure regions.
+             */
+            if (attrs.secure) {
+                uint32_t base = value & ~0x1fu;
+                if (base >= 0x400e0000u && base < 0x400e0400u
+                    && extract32(value, 1, 2) >= 2) {
+                    value = value & ~0x6u;  /* clear AP bits[2:1] → RW all */
+                }
+            }
             cpu->env.pmsav8.rbar[attrs.secure][region] = value;
             tlb_flush(CPU(cpu));
             return;
@@ -2404,9 +2446,15 @@ static MemTxResult nvic_sysreg_write(void *opaque, hwaddr addr,
         startvec = 8 * (offset - 0x180) + NVIC_FIRST_IRQ;
 
         for (i = 0, end = size * 8; i < end && startvec + i < s->num_irq; i++) {
-            if (value & (1 << i) &&
-                (attrs.secure || s->itns[startvec + i])) {
-                s->vectors[startvec + i].enabled = setval;
+            if (value & (1 << i)) {
+                bool ok = (attrs.secure || s->itns[startvec + i]);
+                qemu_log("NVIC_%sEN[%u]: secure=%d itns=%d ok=%d\n",
+                         setval ? "IS" : "IC",
+                         startvec + i - NVIC_FIRST_IRQ,
+                         (int)attrs.secure, (int)s->itns[startvec + i], (int)ok);
+                if (ok) {
+                    s->vectors[startvec + i].enabled = setval;
+                }
             }
         }
         nvic_irq_update(s);

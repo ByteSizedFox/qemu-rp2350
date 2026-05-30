@@ -2059,8 +2059,15 @@ static bool v7m_read_sg_stack_word(ARMCPU *cpu, ARMMMUIdx mmu_idx,
     ARMMMUFaultInfo fi = {};
     uint32_t value;
 
+    fprintf(stderr, "[SG-STACK] reading from addr=0x%08x mmu_idx=%d "
+            "mpu_ctrl_s=0x%x mpu_ctrl_ns=0x%x "
+            "other_ss_msp=0x%08x other_ss_psp=0x%08x\n",
+            addr, mmu_idx,
+            env->v7m.mpu_ctrl[M_REG_S], env->v7m.mpu_ctrl[M_REG_NS],
+            env->v7m.other_ss_msp, env->v7m.other_ss_psp);
     if (get_phys_addr(env, addr, MMU_DATA_LOAD, 0, mmu_idx, &res, &fi)) {
         /* MPU/SAU lookup failed */
+        fprintf(stderr, "[SG-STACK] FAILED fi.type=%d\n", fi.type);
         if (fi.type == ARMFault_QEMU_SFault) {
             qemu_log_mask(CPU_LOG_INT,
                           "...SecureFault during stack word read\n");
@@ -2210,18 +2217,16 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
      */
     switch (cs->exception_index) {
     case EXCP_UDEF:
+        qemu_log("EXCP_UDEF: pc=0x%08x secure=%d\n",
+                 (uint32_t)last_pc, env->v7m.secure);
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_USAGE, env->v7m.secure);
         env->v7m.cfsr[env->v7m.secure] |= R_V7M_CFSR_UNDEFINSTR_MASK;
         break;
     case EXCP_NOCP:
     {
-        /*
-         * NOCP might be directed to something other than the current
-         * security state if this fault is because of NSACR; we indicate
-         * the target security state using exception.target_el.
-         */
         int target_secstate;
-
+        qemu_log("EXCP_NOCP: pc=0x%08x secure=%d\n",
+                 (uint32_t)last_pc, env->v7m.secure);
         if (env->exception.target_el == 3) {
             target_secstate = M_REG_S;
         } else {
@@ -2232,6 +2237,8 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
         break;
     }
     case EXCP_INVSTATE:
+        qemu_log("EXCP_INVSTATE: pc=0x%08x secure=%d\n",
+                 (uint32_t)last_pc, env->v7m.secure);
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_USAGE, env->v7m.secure);
         env->v7m.cfsr[env->v7m.secure] |= R_V7M_CFSR_INVSTATE_MASK;
         break;
@@ -2371,6 +2378,8 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
         qemu_plugin_vcpu_hostcall_cb(cs, last_pc);
         return;
     case EXCP_BKPT:
+        qemu_log("EXCP_BKPT: pc=0x%08x exc=%d secure=%d\n",
+                 (uint32_t)last_pc, env->v7m.exception, env->v7m.secure);
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_DEBUG, false);
         break;
     case EXCP_IRQ:
@@ -2867,17 +2876,26 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
         nsrw = false;
     }
 
-    tt_resp = (sattrs.iregion << 24) |
-        (sattrs.irvalid << 23) |
-        ((!sattrs.ns) << 22) |
-        (nsrw << 21) |
-        (nsr << 20) |
-        (rw << 19) |
-        (r << 18) |
-        (sattrs.srvalid << 17) |
-        (mrvalid << 16) |
-        (sattrs.sregion << 8) |
-        mregion;
+    tt_resp = ((sattrs.irvalid ? (uint32_t)(sattrs.iregion & 0xFF) : 0u) << 24) |
+        ((uint32_t)sattrs.irvalid << 23) |
+        ((uint32_t)(!sattrs.ns) << 22) |
+        ((uint32_t)nsrw << 21) |
+        ((uint32_t)nsr << 20) |
+        ((uint32_t)rw << 19) |
+        ((uint32_t)r << 18) |
+        ((uint32_t)sattrs.srvalid << 17) |
+        ((uint32_t)mrvalid << 16) |
+        ((sattrs.sregion & 0xFF) << 8) |
+        (mregion & 0xFF);
+
+    if (addr == 0x7fe1u) {
+        fprintf(stderr, "[TT 0x7FE1] result=0x%08x irvalid=%d iregion=%d ns=%d nsc=%d"
+                " nsr=%d nsrw=%d r=%d rw=%d srvalid=%d sregion=%d mrvalid=%d mregion=%d"
+                " secure_state=%d\n",
+                tt_resp, sattrs.irvalid, sattrs.iregion, sattrs.ns, sattrs.nsc,
+                nsr, nsrw, r, rw, sattrs.srvalid, sattrs.sregion, mrvalid, mregion,
+                env->v7m.secure);
+    }
 
     return tt_resp;
 }

@@ -743,7 +743,11 @@ static bool trans_NOCP(DisasContext *s, arg_nocp *a)
     }
 
     if (a->cp != 10) {
-        gen_exception_insn(s, 0, EXCP_NOCP, syn_uncategorized());
+        /*
+         * RP2350 uses CP0, CP4, and CP7 (RCP) as custom coprocessors.
+         * Treat all non-FPU coprocessor accesses as no-ops in emulation
+         * rather than raising NOCP UsageFault.
+         */
         return true;
     }
 

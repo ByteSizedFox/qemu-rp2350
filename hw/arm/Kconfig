@@ -666,6 +666,14 @@ config FSL_IMX6UL
     select USB_CHIPIDEA
     select UNIMP
 
+config RP2350
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_V7M
+    select PL011
+    select UNIMP
+
 config MICROBIT
     bool
     default y
