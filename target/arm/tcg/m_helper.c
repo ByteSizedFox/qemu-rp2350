@@ -2888,15 +2888,6 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
         ((sattrs.sregion & 0xFF) << 8) |
         (mregion & 0xFF);
 
-    if (addr == 0x7fe1u) {
-        fprintf(stderr, "[TT 0x7FE1] result=0x%08x irvalid=%d iregion=%d ns=%d nsc=%d"
-                " nsr=%d nsrw=%d r=%d rw=%d srvalid=%d sregion=%d mrvalid=%d mregion=%d"
-                " secure_state=%d\n",
-                tt_resp, sattrs.irvalid, sattrs.iregion, sattrs.ns, sattrs.nsc,
-                nsr, nsrw, r, rw, sattrs.srvalid, sattrs.sregion, mrvalid, mregion,
-                env->v7m.secure);
-    }
-
     return tt_resp;
 }
 

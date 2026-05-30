@@ -532,14 +532,6 @@ static void nvic_irq_update(NVICState *s)
      */
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
-    /* Diagnostic: log when USB IRQ (14, exc 30) is involved */
-    if (s->vectpending == 30 || s->vectors[30].pending || s->vectors[30].active) {
-        qemu_log("nvic_irq_update: vectpending=%d pend_prio=%d exc_prio=%d lvl=%d "
-                 "usb14: en=%d pend=%d act=%d lv=%d\n",
-                 s->vectpending, pend_prio, s->exception_prio, lvl,
-                 (int)s->vectors[30].enabled, (int)s->vectors[30].pending,
-                 (int)s->vectors[30].active, (int)s->vectors[30].level);
-    }
     qemu_set_irq(s->excpout, lvl);
 }
 
@@ -2448,10 +2440,6 @@ static MemTxResult nvic_sysreg_write(void *opaque, hwaddr addr,
         for (i = 0, end = size * 8; i < end && startvec + i < s->num_irq; i++) {
             if (value & (1 << i)) {
                 bool ok = (attrs.secure || s->itns[startvec + i]);
-                qemu_log("NVIC_%sEN[%u]: secure=%d itns=%d ok=%d\n",
-                         setval ? "IS" : "IC",
-                         startvec + i - NVIC_FIRST_IRQ,
-                         (int)attrs.secure, (int)s->itns[startvec + i], (int)ok);
                 if (ok) {
                     s->vectors[startvec + i].enabled = setval;
                 }

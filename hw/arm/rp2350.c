@@ -21,6 +21,7 @@
 #include "hw/char/serial.h"
 #include "hw/core/irq.h"
 #include "chardev/char.h"
+#include "chardev/char-fe.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "hw/core/loader.h"
@@ -44,6 +45,10 @@
 #define UF2_BLOCK_SIZE       512u
 
 /* RP2350 memory map */
+/* Debug logging: only emitted when -machine rp2350,debug=on */
+#define RP2350_LOG(s, fmt, ...) \
+    do { if ((s)->debug) { qemu_log(fmt, ##__VA_ARGS__); } } while (0)
+
 #define RP2350_ROM_BASE     0x00000000u
 #define RP2350_ROM_SIZE     (32u * KiB)
 #define RP2350_FLASH_BASE   0x10000000u
@@ -226,6 +231,16 @@ struct RP2350MachineState {
     /* Persistent flash backing file (set via -machine rp2350,flash=path) */
     char    *flash_file;
     Notifier flash_save_notifier;
+
+    /* Verbose debug logging (-machine rp2350,debug=on) */
+    bool    debug;
+
+    /* CDC host→device RX: CharFrontend claimed on serial_hd(0) when RUNNING,
+     * ring buffer drained into EP2 OUT DPRAM each 1ms tick. */
+    CharFrontend cdc_chr;
+    uint8_t cdc_rx_buf[512];
+    int     cdc_rx_head;
+    int     cdc_rx_len;
 };
 
 /* --------------------------------------------------------------------------
@@ -349,7 +364,7 @@ static void clocks_write(void *opaque, hwaddr addr,
     case 2: s->clocks_ctrl[clk] |= (uint32_t)data; break;
     case 3: s->clocks_ctrl[clk] &= ~(uint32_t)data; break;
     }
-    qemu_log("clocks_write: clk=%d alias=%d data=0x%" PRIx64 " old=0x%x -> new=0x%x\n",
+    RP2350_LOG(s, "clocks_write: clk=%d alias=%d data=0x%" PRIx64 " old=0x%x -> new=0x%x\n",
              clk, alias, data, old, s->clocks_ctrl[clk]);
 }
 
@@ -546,7 +561,7 @@ static uint64_t apb_stub_read(void *opaque, hwaddr addr, unsigned int size)
     val = 0;
 
 out:
-    qemu_log("apb_stub_read: @ 0x%" HWADDR_PRIx " = 0x%x\n", addr, val);
+    RP2350_LOG(s, "apb_stub_read: @ 0x%" HWADDR_PRIx " = 0x%x\n", addr, val);
     return val;
 }
 
@@ -556,7 +571,7 @@ static void apb_stub_write(void *opaque, hwaddr addr,
     RP2350MachineState *s = opaque;
     uint32_t reg_off = addr & 0xFFF;
 
-    qemu_log("apb_stub_write: @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, data);
+    RP2350_LOG(s, "apb_stub_write: @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, data);
 
     /* QMI at 0x400D0000 */
     if ((addr & ~0x3FFFu) == 0xD0000) {
@@ -769,7 +784,7 @@ static void sio_handle_cpu1_launch_word(RP2350MachineState *s, uint32_t word)
     /* Expected sequence: {0, 0, 1, vtor, sp, entry} */
     static const uint32_t expected_prefix[3] = {0, 0, 1};
 
-    qemu_log("sio_launch: step=%d word=0x%08x\n", s->cpu1_launch_step, word);
+    RP2350_LOG(s, "sio_launch: step=%d word=0x%08x\n", s->cpu1_launch_step, word);
 
     if (s->cpu1_launch_step < 3) {
         if (word == expected_prefix[s->cpu1_launch_step]) {
@@ -809,7 +824,7 @@ static uint64_t sio_read(void *opaque, hwaddr addr, unsigned int size)
         val = cpu_idx;
         if (current_cpu) {
             ARMCPU *acpu = ARM_CPU(current_cpu);
-            qemu_log("sio_cpuid: cpu=%d pc=0x%08x\n",
+            RP2350_LOG(s, "sio_cpuid: cpu=%d pc=0x%08x\n",
                      cpu_idx, acpu->env.regs[15]);
         }
         break;
@@ -855,7 +870,7 @@ static uint64_t sio_read(void *opaque, hwaddr addr, unsigned int size)
         }
         break;
     }
-    qemu_log("sio_read:  @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, val);
+    RP2350_LOG(s, "sio_read:  @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, val);
     return val;
 }
 
@@ -865,7 +880,7 @@ static void sio_write(void *opaque, hwaddr addr,
     RP2350MachineState *s = opaque;
     int cpu_idx = current_cpu ? current_cpu->cpu_index : 0;
 
-    qemu_log("sio_write: @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, data);
+    RP2350_LOG(s, "sio_write: @ 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, data);
 
     switch (addr) {
     case SIO_FIFO_WR: {
@@ -1193,6 +1208,7 @@ static void rp2350_sau_reset(void *opaque)
  */
 #define DPRAM_EP1_CTRL_IN   0x008u   /* EP1 IN  endpoint control                */
 #define DPRAM_EP2_CTRL_IN   0x010u   /* EP2 IN  endpoint control                */
+#define DPRAM_EP2_CTRL_OUT  0x014u   /* EP2 OUT endpoint control                */
 #define DPRAM_EP0_BUF_IN    0x080u   /* EP0 IN  buffer control                  */
 #define DPRAM_EP1_BUF_IN    0x088u   /* EP1 IN  buffer control                  */
 #define DPRAM_EP2_BUF_IN    0x090u   /* EP2 IN  buffer control                  */
@@ -1249,7 +1265,7 @@ static inline void usb_update_irq(RP2350MachineState *s)
     uint32_t ints = (s->usb_intr | (s->usb_buff_status ? USB_INTR_BUFF : 0))
                     & s->usb_inte;
     int level = ints ? 1 : 0;
-    qemu_log("usb_irq: level=%d ints=0x%x\n", level, ints);
+    RP2350_LOG(s, "usb_irq: level=%d ints=0x%x\n", level, ints);
     qemu_set_irq(s->usb_irq, level);
 }
 
@@ -1270,7 +1286,7 @@ static uint64_t usb_dpram_read(void *opaque, hwaddr addr, unsigned size)
         memcpy(&val, s->usb_dpram_buf + off, size);
     /* Log reads from setup packet + EP0 buf_ctrl area (important for USB debug) */
     if (((off < 0x10) || (off >= 0x07c && off <= 0x090)) && size >= 2)
-        qemu_log("dpram_rd[0x%03x]=%0*llx (sz=%d)\n",
+        RP2350_LOG(s, "dpram_rd[0x%03x]=%0*llx (sz=%d)\n",
                  (uint32_t)off, size * 2, (unsigned long long)val, size);
     return val;
 }
@@ -1299,7 +1315,7 @@ static void usb_dpram_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     if (addr >= 0x008 && addr < 0x100) {
         uint32_t ep_n = ((uint32_t)addr - 0x008) / 8 + 1;
         const char *dir = (((uint32_t)addr - 0x008) % 8 < 4) ? "IN" : "OUT";
-        qemu_log("dpram_wr[0x%03x]=0x%0*llx EP%u_%s %s\n",
+        RP2350_LOG(s, "dpram_wr[0x%03x]=0x%0*llx EP%u_%s %s\n",
                  (uint32_t)addr, size * 2, (unsigned long long)val,
                  ep_n, dir,
                  (addr < 0x080) ? "ctrl" : "buf_ctrl");
@@ -1316,7 +1332,7 @@ static void usb_dpram_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
      * Inject 50µs after the write (giving the AVAIL bit write and any ISB time).
      */
     if (addr == 0x080)
-        qemu_log("dpram_wr[0x080]=0x%llx (EP0_IN buf_ctrl) state=%d buff=0x%x\n",
+        RP2350_LOG(s, "dpram_wr[0x080]=0x%llx (EP0_IN buf_ctrl) state=%d buff=0x%x\n",
                  (unsigned long long)val, s->usb_state, s->usb_buff_status);
     /* Trigger only when AVAIL is set (second write of hw_endpoint_xfer_start).
      * Triggering on the first write (before AVAIL) would race with the ISR. */
@@ -1324,7 +1340,7 @@ static void usb_dpram_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
         (s->usb_state == USB_ST_ADDR_STATUS ||
          s->usb_state == USB_ST_CFG_STATUS  ||
          s->usb_state == USB_ST_LST_STATUS)) {
-        qemu_log("dpram_wr: EP0_IN buf_ctrl=0x%llx → schedule BUFF_STATUS state=%d\n",
+        RP2350_LOG(s, "dpram_wr: EP0_IN buf_ctrl=0x%llx → schedule BUFF_STATUS state=%d\n",
                  (unsigned long long)val, s->usb_state);
         int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
         timer_mod(s->usb_timer, now + 50);
@@ -1338,12 +1354,14 @@ static const MemoryRegionOps usb_dpram_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+static void rp2350_cdc_attach_serial(RP2350MachineState *s);
+
 static void usb_inject_setup(RP2350MachineState *s, const uint8_t pkt[8])
 {
     memcpy(s->usb_dpram_buf + DPRAM_SETUP_PKT, pkt, 8);
     s->usb_sie_status |= USB_SIE_SETUP_REC;
     s->usb_intr       |= USB_INTR_SETUP_REQ;
-    qemu_log("usb_inject_setup: bRequest=0x%02x state=%d intr=0x%x inte=0x%x\n",
+    RP2350_LOG(s, "usb_inject_setup: bRequest=0x%02x state=%d intr=0x%x inte=0x%x\n",
              pkt[1], s->usb_state, s->usb_intr, s->usb_inte);
     usb_update_irq(s);
 }
@@ -1359,7 +1377,7 @@ static void usb_timer_cb(void *opaque)
     uint8_t *dpram = s->usb_dpram_buf;
     uint64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
 
-    qemu_log("usb_timer: state=%d intr=0x%x inte=0x%x buff=0x%x\n",
+    RP2350_LOG(s, "usb_timer: state=%d intr=0x%x inte=0x%x buff=0x%x\n",
              s->usb_state, s->usb_intr, s->usb_inte, s->usb_buff_status);
 
     switch (s->usb_state) {
@@ -1392,7 +1410,7 @@ static void usb_timer_cb(void *opaque)
         memcpy(&ep0_in_bc, s->usb_dpram_buf + 0x080, 4);
         bool ep0_in_ready = (ep0_in_bc & 0x8000u) != 0;  /* FULL bit = ep->active */
         if (s->usb_buff_status & 0x1u) {
-            qemu_log("usb_timer: BUFF EP0_IN still pending state=%d\n", s->usb_state);
+            RP2350_LOG(s, "usb_timer: BUFF EP0_IN still pending state=%d\n", s->usb_state);
             usb_update_irq(s);
             timer_mod(s->usb_timer, now + 200);
         } else if (ep0_in_ready) {
@@ -1401,12 +1419,12 @@ static void usb_timer_cb(void *opaque)
             ep0_in_bc &= ~BUF_CTRL_AVAIL;
             memcpy(s->usb_dpram_buf + 0x080, &ep0_in_bc, 4);
             s->usb_buff_status |= 0x1u;
-            qemu_log("usb_timer: inject BUFF EP0_IN state=%d (ep0bc=0x%x)\n",
+            RP2350_LOG(s, "usb_timer: inject BUFF EP0_IN state=%d (ep0bc=0x%x)\n",
                      s->usb_state, ep0_in_bc);
             usb_update_irq(s);
             timer_mod(s->usb_timer, now + 200);
         } else {
-            qemu_log("usb_timer: ep0_in not ready (bc=0x%x) state=%d, retry\n",
+            RP2350_LOG(s, "usb_timer: ep0_in not ready (bc=0x%x) state=%d, retry\n",
                      ep0_in_bc, s->usb_state);
             timer_mod(s->usb_timer, now + 5000);
         }
@@ -1415,7 +1433,7 @@ static void usb_timer_cb(void *opaque)
 
     case USB_ST_SET_CFG:
         if (s->usb_intr & USB_INTR_SETUP_REQ) {
-            qemu_log("usb_timer: re-assert SETUP_REQ state=%d\n", s->usb_state);
+            RP2350_LOG(s, "usb_timer: re-assert SETUP_REQ state=%d\n", s->usb_state);
             usb_update_irq(s);
         } else {
             usb_inject_setup(s, usb_pkt_set_cfg);
@@ -1425,7 +1443,7 @@ static void usb_timer_cb(void *opaque)
 
     case USB_ST_CDC_LST:
         if (s->usb_intr & USB_INTR_SETUP_REQ) {
-            qemu_log("usb_timer: re-assert SETUP_REQ state=%d\n", s->usb_state);
+            RP2350_LOG(s, "usb_timer: re-assert SETUP_REQ state=%d\n", s->usb_state);
             usb_update_irq(s);
         } else {
             usb_inject_setup(s, usb_pkt_cdc_lst);
@@ -1451,27 +1469,27 @@ static void usb_timer_cb(void *opaque)
         static int running_count = 0;
         if (running_count++ < 5) {
             uint32_t v;
-            qemu_log("usb_dpram_dump (call %d):\n", running_count);
+            RP2350_LOG(s, "usb_dpram_dump (call %d):\n", running_count);
             /* ep_ctrl[EP1..EP7]: 0x008 - 0x040 */
             for (uint32_t off = 0x008; off < 0x048; off += 4) {
                 memcpy(&v, dpram + off, 4);
-                if (v) qemu_log("  dpram[0x%03x]=0x%08x (ep_ctrl EP%d %s)\n",
-                                off, v,
-                                (off - 0x008) / 8 + 1,
-                                ((off - 0x008) % 8) ? "OUT" : "IN");
+                if (v) RP2350_LOG(s, "  dpram[0x%03x]=0x%08x (ep_ctrl EP%d %s)\n",
+                                  off, v,
+                                  (off - 0x008) / 8 + 1,
+                                  ((off - 0x008) % 8) ? "OUT" : "IN");
             }
             /* ep_buf_ctrl[EP0..EP5]: 0x080 - 0x0B0 */
             for (uint32_t off = 0x080; off < 0x0B0; off += 4) {
                 memcpy(&v, dpram + off, 4);
-                if (v) qemu_log("  dpram[0x%03x]=0x%08x (ep_buf_ctrl EP%d %s)\n",
-                                off, v,
-                                (off - 0x080) / 8,
-                                ((off - 0x080) % 8) ? "OUT" : "IN");
+                if (v) RP2350_LOG(s, "  dpram[0x%03x]=0x%08x (ep_buf_ctrl EP%d %s)\n",
+                                  off, v,
+                                  (off - 0x080) / 8,
+                                  ((off - 0x080) % 8) ? "OUT" : "IN");
             }
             /* Data buffers start at 0x100 */
             for (uint32_t off = 0x100; off < 0x140; off += 4) {
                 memcpy(&v, dpram + off, 4);
-                if (v) qemu_log("  dpram[0x%03x]=0x%08x (data buf)\n", off, v);
+                if (v) RP2350_LOG(s, "  dpram[0x%03x]=0x%08x (data buf)\n", off, v);
             }
         }
 
@@ -1484,7 +1502,7 @@ static void usb_timer_cb(void *opaque)
                 uint32_t ep2_ctrl;
                 memcpy(&ep2_ctrl, dpram + DPRAM_EP2_CTRL_IN, 4);
                 uint32_t buf_addr = ep2_ctrl & 0x0000FFFFu;
-                qemu_log("usb_ep2_in: FULL len=%d ctrl=0x%x buf_addr=0x%x\n",
+                RP2350_LOG(s, "usb_ep2_in: FULL len=%d ctrl=0x%x buf_addr=0x%x\n",
                          len, ep2_ctrl, buf_addr);
                 if (buf_addr >= 0x100 && buf_addr < 0x1000) {
                     Chardev *chr = serial_hd(0);
@@ -1498,6 +1516,37 @@ static void usb_timer_cb(void *opaque)
             s->usb_buff_status |= (1u << 4);  /* EP2 IN done */
             usb_update_irq(s);
         }
+
+        /* EP2 OUT: inject any buffered host→device (keyboard) input.
+         * Check that the firmware has armed the endpoint (AVAIL set), then
+         * write up to 64 bytes into its DPRAM buffer and signal BUFF_STATUS. */
+        if (s->cdc_rx_len > 0) {
+            uint32_t out_bc;
+            memcpy(&out_bc, dpram + DPRAM_EP2_BUF_OUT, 4);
+            if (out_bc & BUF_CTRL_AVAIL) {
+                uint32_t out_ctrl;
+                memcpy(&out_ctrl, dpram + DPRAM_EP2_CTRL_OUT, 4);
+                uint32_t buf_addr = out_ctrl & 0x0000FFFFu;
+                if (buf_addr >= 0x100 && buf_addr < 0x1000) {
+                    uint16_t max_len = out_bc & BUF_CTRL_LEN_MASK;
+                    if (max_len == 0 || max_len > 64) max_len = 64;
+                    int to_send = MIN(s->cdc_rx_len, (int)max_len);
+                    for (int i = 0; i < to_send; i++) {
+                        dpram[buf_addr + i] = s->cdc_rx_buf[
+                            (s->cdc_rx_head + i) % (int)sizeof(s->cdc_rx_buf)];
+                    }
+                    s->cdc_rx_head = (s->cdc_rx_head + to_send)
+                                     % (int)sizeof(s->cdc_rx_buf);
+                    s->cdc_rx_len -= to_send;
+                    out_bc = (out_bc & ~(BUF_CTRL_AVAIL | BUF_CTRL_LEN_MASK))
+                             | BUF_CTRL_FULL | (uint32_t)to_send;
+                    memcpy(dpram + DPRAM_EP2_BUF_OUT, &out_bc, 4);
+                    s->usb_buff_status |= (1u << 5);  /* EP2 OUT done */
+                    usb_update_irq(s);
+                }
+            }
+        }
+
         timer_mod(s->usb_timer,
                   qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + 1000);
         break;
@@ -1521,21 +1570,21 @@ static uint64_t usb_reg_read(void *opaque, hwaddr addr, unsigned size)
     case USB_REG_SIE_STATUS:
         val = s->usb_sie_status;
         if (s->usb_state >= USB_ST_BUS_RESET) val |= USB_SIE_CONNECTED;
-        qemu_log("usb_sie_read: val=0x%x state=%d\n", val, s->usb_state);
+        RP2350_LOG(s, "usb_sie_read: val=0x%x state=%d\n", val, s->usb_state);
         break;
     case USB_REG_BUFF_STATUS:
         val = s->usb_buff_status;
-        qemu_log("usb_buff_read: buff=0x%x state=%d\n", val, s->usb_state);
+        RP2350_LOG(s, "usb_buff_read: buff=0x%x state=%d\n", val, s->usb_state);
         break;
     case USB_REG_EP_ABORT:    val = s->usb_ep_abort; break;
     case USB_REG_EP_ABTDONE:
         /* Simulate instant abort completion: return same bits as EP_ABORT. */
         val = s->usb_ep_abort;
-        qemu_log("usb_ep_abtdone_read: val=0x%x state=%d\n", val, s->usb_state);
+        RP2350_LOG(s, "usb_ep_abtdone_read: val=0x%x state=%d\n", val, s->usb_state);
         break;
     case USB_REG_INTR:
         val = s->usb_intr;
-        qemu_log("usb_intr_read: intr=0x%x state=%d\n", val, s->usb_state);
+        RP2350_LOG(s, "usb_intr_read: intr=0x%x state=%d\n", val, s->usb_state);
         break;
     case USB_REG_INTE:        val = s->usb_inte; break;
     case USB_REG_INTS:
@@ -1547,7 +1596,7 @@ static uint64_t usb_reg_read(void *opaque, hwaddr addr, unsigned size)
             s->usb_intr &= ~USB_INTR_SOF;
             usb_update_irq(s);
         }
-        qemu_log("usb_ints_read: ints=0x%x state=%d intr=0x%x\n",
+        RP2350_LOG(s, "usb_ints_read: ints=0x%x state=%d intr=0x%x\n",
                  val, s->usb_state, s->usb_intr);
         break;
     default:                  val = 0; break;
@@ -1563,7 +1612,7 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
 
     /* SIE_STATUS and BUFF_STATUS are write-1-to-clear */
     if (reg == USB_REG_SIE_STATUS) {
-        qemu_log("usb_sie_status W1C: data=0x%x sie_was=0x%x intr_was=0x%x state=%d\n",
+        RP2350_LOG(s, "usb_sie_status W1C: data=0x%x sie_was=0x%x intr_was=0x%x state=%d\n",
                  (uint32_t)data, s->usb_sie_status, s->usb_intr, s->usb_state);
         s->usb_sie_status &= ~(uint32_t)data;
         /* Mirror clears to INTR */
@@ -1615,7 +1664,7 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
     }
     if (reg == USB_REG_BUFF_STATUS) {
         uint64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
-        qemu_log("usb_buff_status W1C: data=0x%x was=0x%x state=%d\n",
+        RP2350_LOG(s, "usb_buff_status W1C: data=0x%x was=0x%x state=%d\n",
                  (uint32_t)data, s->usb_buff_status, s->usb_state);
         s->usb_buff_status &= ~(uint32_t)data;
         if (!s->usb_buff_status) s->usb_intr &= ~USB_INTR_BUFF;
@@ -1631,6 +1680,7 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
                 timer_mod(s->usb_timer, now + 5000);  /* 5ms: let tud_task finish SET_CONFIG */
             } else if (s->usb_state == USB_ST_LST_STATUS) {
                 s->usb_state = USB_ST_RUNNING;
+                rp2350_cdc_attach_serial(s);
                 timer_mod(s->usb_timer, now + 1000);
             }
         }
@@ -1657,11 +1707,11 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
                     memcpy(&bc, s->usb_dpram_buf + bc_off, 4);
                     bc &= ~BUF_CTRL_AVAIL;
                     memcpy(s->usb_dpram_buf + bc_off, &bc, 4);
-                    qemu_log("usb_ep_abort: bit=%u bc_off=0x%03x cleared AVAIL\n", bit, bc_off);
+                    RP2350_LOG(s, "usb_ep_abort: bit=%u bc_off=0x%03x cleared AVAIL\n", bit, bc_off);
                 }
             }
         }
-        qemu_log("usb_ep_abort_write: alias=%d data=0x%x now=0x%x state=%d\n",
+        RP2350_LOG(s, "usb_ep_abort_write: alias=%d data=0x%x now=0x%x state=%d\n",
                  alias, (uint32_t)data, s->usb_ep_abort, s->usb_state);
         return;
     }
@@ -1672,11 +1722,11 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
     case USB_REG_MAIN_CTRL: tgt = &s->usb_main_ctrl; break;
     case USB_REG_INTE:
         tgt = &s->usb_inte;
-        qemu_log("usb_inte_write: alias=%d data=0x%x old_inte=0x%x state=%d\n",
+        RP2350_LOG(s, "usb_inte_write: alias=%d data=0x%x old_inte=0x%x state=%d\n",
                  alias, (uint32_t)data, s->usb_inte, s->usb_state);
         break;
     default:
-        qemu_log("usb_reg_write: UNHANDLED reg=0x%03x data=0x%08x alias=%d state=%d\n",
+        RP2350_LOG(s, "usb_reg_write: UNHANDLED reg=0x%03x data=0x%08x alias=%d state=%d\n",
                  reg, (uint32_t)data, alias, s->usb_state);
         return;
     }
@@ -1844,14 +1894,43 @@ static void rp2350_init(MachineState *machine)
                            RP2350_ROM_SIZE, &error_fatal);
     memory_region_add_subregion(sys_mem, RP2350_ROM_BASE, &s->rom);
     if (machine->firmware) {
-        ssize_t sz = load_image_targphys(machine->firmware,
-                                         RP2350_ROM_BASE, RP2350_ROM_SIZE,
-                                         NULL);
+        uint8_t *rom_buf = g_malloc0(RP2350_ROM_SIZE);
+        ssize_t sz = load_image_size(machine->firmware, rom_buf,
+                                     RP2350_ROM_SIZE);
         if (sz < 0) {
             error_report("rp2350: failed to load bootrom '%s'",
                          machine->firmware);
             exit(1);
         }
+        /*
+         * Auto-patch the A4 bootrom for QEMU compatibility so that
+         * bootrom-combined.bin (the unmodified stock binary) works directly.
+         *
+         * Patch 1: byte 0x13 — ROM lookup dispatch selector.
+         *   Stock A4 value 0x04 makes pico-sdk use the wrong lookup wrapper,
+         *   producing an unaligned branch fault.  0x02 selects the correct one.
+         */
+        if ((size_t)sz > 0x13 && rom_buf[0x13] == 0x04) {
+            rom_buf[0x13] = 0x02;
+            warn_report("rp2350: auto-patched bootrom[0x13]: 0x04→0x02 "
+                        "(ROM lookup dispatch)");
+        }
+        /*
+         * Patch 2: offset 0x3dc — STR.W R10,[R4] that zeros SCB.VTOR.
+         *   The bootrom's flash-image-discovery finds nothing in QEMU's XIP
+         *   region, so R10=0 when this store runs, clobbering the VTOR value
+         *   set by the SAU reset hook.  Replace with two Thumb-16 NOPs.
+         */
+        static const uint8_t str_r10_vtor[4] = { 0xc4, 0xf8, 0x00, 0xa0 };
+        static const uint8_t thumb_nop2[4]   = { 0x00, 0xbf, 0x00, 0xbf };
+        if ((size_t)sz > 0x3df &&
+                memcmp(rom_buf + 0x3dc, str_r10_vtor, 4) == 0) {
+            memcpy(rom_buf + 0x3dc, thumb_nop2, 4);
+            warn_report("rp2350: auto-patched bootrom[0x3dc]: "
+                        "STR.W R10,[R4]→NOP;NOP (prevent VTOR zeroing)");
+        }
+        rom_add_blob_fixed("rp2350.bootrom", rom_buf, sz, RP2350_ROM_BASE);
+        g_free(rom_buf);
     }
 
     /* --- Flash (XIP, writable RAM) at 0x10000000 and aliases ---
@@ -2094,6 +2173,56 @@ static void rp2350_set_flash_file(Object *obj, const char *value, Error **errp)
     s->flash_file = g_strdup(value);
 }
 
+/* --- CDC serial input chardev handlers ----------------------------------- */
+
+static int rp2350_cdc_can_receive(void *opaque)
+{
+    RP2350MachineState *s = opaque;
+    return (int)(sizeof(s->cdc_rx_buf)) - s->cdc_rx_len;
+}
+
+static void rp2350_cdc_receive(void *opaque, const uint8_t *buf, int size)
+{
+    RP2350MachineState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        if (s->cdc_rx_len < (int)sizeof(s->cdc_rx_buf)) {
+            int tail = (s->cdc_rx_head + s->cdc_rx_len) % (int)sizeof(s->cdc_rx_buf);
+            s->cdc_rx_buf[tail] = buf[i];
+            s->cdc_rx_len++;
+        }
+    }
+}
+
+/* Called once when CDC enumeration completes (USB_ST_RUNNING).
+ * Steals serial_hd(0) from any existing frontend (e.g. PL011 — which is idle
+ * for USB CDC firmware) so that typed input reaches the CDC REPL. */
+static void rp2350_cdc_attach_serial(RP2350MachineState *s)
+{
+    Chardev *chr = serial_hd(0);
+    if (!chr) {
+        return;
+    }
+    /* Release any existing frontend so qemu_chr_fe_init can claim the chardev. */
+    chr->fe = NULL;
+    if (!qemu_chr_fe_init(&s->cdc_chr, chr, NULL)) {
+        return;
+    }
+    qemu_chr_fe_set_handlers(&s->cdc_chr, rp2350_cdc_can_receive,
+                             rp2350_cdc_receive, NULL, NULL, s, NULL, true);
+}
+
+/* --- debug property ------------------------------------------------------- */
+
+static bool rp2350_get_debug(Object *obj, Error **errp)
+{
+    return RP2350_MACHINE(obj)->debug;
+}
+
+static void rp2350_set_debug(Object *obj, bool val, Error **errp)
+{
+    RP2350_MACHINE(obj)->debug = val;
+}
+
 static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
 {
     IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(oc);
@@ -2131,6 +2260,12 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
                                   rp2350_set_flash_file);
     object_class_property_set_description(oc, "flash",
         "Path to 4 MiB flash backing file (preserves littlefs across runs)");
+
+    object_class_property_add_bool(oc, "debug",
+                                   rp2350_get_debug,
+                                   rp2350_set_debug);
+    object_class_property_set_description(oc, "debug",
+        "Enable verbose RP2350 peripheral debug logging");
 }
 
 static const InterfaceInfo rp2350_machine_interfaces[] = {
