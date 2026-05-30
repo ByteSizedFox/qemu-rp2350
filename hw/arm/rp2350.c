@@ -194,8 +194,14 @@ struct RP2350MachineState {
     uint32_t cpu1_launch_sp;
     uint32_t cpu1_launch_entry;
 
-    /* QMI (QSPI Memory Interface) simple stub FIFO */
-    int      qmi_rx_count;  /* bytes pending in RX FIFO (1 per NOPUSH=0 TX) */
+    /* QMI (QSPI Memory Interface) SPI flash state machine */
+    int      qmi_rx_count;   /* bytes pending in RX FIFO (1 per NOPUSH=0 TX entry) */
+    uint8_t  qmi_spi_cmd;    /* current SPI command byte (0 = idle) */
+    uint8_t  qmi_spi_addr[3];/* address accumulator for erase/program */
+    int      qmi_spi_addr_len;/* address bytes received so far */
+    bool     qmi_spi_in_data; /* true while receiving PP page-program data */
+    uint32_t qmi_spi_pp_off;  /* flash byte offset for current page program */
+    uint32_t qmi_spi_pp_cnt;  /* data bytes written in current page program */
 
     /* USB CDC state machine */
     int      usb_state;
@@ -545,7 +551,105 @@ static void apb_stub_write(void *opaque, hwaddr addr,
     /* QMI at 0x400D0000 */
     if ((addr & ~0x3FFFu) == 0xD0000) {
         if (reg_off == 0x04) { /* DIRECT_TX */
-            if (!(data & (1u << 20))) { /* NOPUSH=0: each TX byte produces one RX byte */
+            bool nopush = (data >> 20) & 1;
+            bool dwidth = (data >> 18) & 1;
+            /* Extract bytes: DWIDTH=1 sends DATA[7:0] first, then DATA[15:8] */
+            uint8_t b[2] = { data & 0xFF, (data >> 8) & 0xFF };
+            int nb = dwidth ? 2 : 1;
+
+            for (int i = 0; i < nb; i++) {
+                uint8_t byte = b[i];
+
+                /*
+                 * PP data phase ends when a NOPUSH=1 byte arrives — that's
+                 * the start of the next command (e.g. RDSR busy-poll).
+                 * The data has already been written byte-by-byte, so just
+                 * reset the state.
+                 */
+                if (nopush && s->qmi_spi_in_data) {
+                    s->qmi_spi_in_data = false;
+                    s->qmi_spi_cmd     = 0;
+                    s->qmi_spi_pp_cnt  = 0;
+                }
+
+                if (s->qmi_spi_cmd == 0) {
+                    /* First byte of a new SPI transaction: decode command. */
+                    switch (byte) {
+                    case 0x06: /* WREN */
+                    case 0x04: /* WRDI */
+                        break; /* single-byte commands; no further bytes */
+                    case 0x05: /* RDSR */
+                    case 0x35: /* RDSR2 */
+                    case 0x01: /* WRSR */
+                    case 0x20: /* Sector Erase 4 KB */
+                    case 0x02: /* Page Program */
+                    case 0xD8: /* Block Erase 64 KB */
+                        s->qmi_spi_cmd      = byte;
+                        s->qmi_spi_addr_len = 0;
+                        break;
+                    default:
+                        break;
+                    }
+                } else if (s->qmi_spi_cmd == 0x05 || s->qmi_spi_cmd == 0x35) {
+                    /* RDSR/RDSR2: one dummy byte clocks out the status byte. */
+                    s->qmi_spi_cmd = 0;
+                } else if (s->qmi_spi_cmd == 0x01) {
+                    /* WRSR: two data bytes (SR1, SR2). */
+                    if (++s->qmi_spi_addr_len >= 2) {
+                        s->qmi_spi_cmd = 0;
+                    }
+                } else if (s->qmi_spi_cmd == 0x02 && s->qmi_spi_in_data) {
+                    /* Page-program data byte: AND into flash (NOR flash semantics).
+                     * This must come BEFORE the address-accumulation branch below
+                     * because cmd==0x02 also matches that branch. */
+                    uint8_t *fp = memory_region_get_ram_ptr(&s->flash);
+                    /* Writes wrap within the 256-byte page. */
+                    uint32_t page = s->qmi_spi_pp_off & ~0xFFu;
+                    uint32_t pos  = (s->qmi_spi_pp_off + s->qmi_spi_pp_cnt) & 0xFF;
+                    uint32_t tgt  = page + pos;
+                    if (tgt < RP2350_FLASH_SIZE) {
+                        fp[tgt] &= byte;
+                    }
+                    s->qmi_spi_pp_cnt++;
+                } else if (s->qmi_spi_cmd == 0x20 || s->qmi_spi_cmd == 0x02
+                           || s->qmi_spi_cmd == 0xD8) {
+                    /* Accumulate 3-byte address. */
+                    if (s->qmi_spi_addr_len < 3) {
+                        s->qmi_spi_addr[s->qmi_spi_addr_len++] = byte;
+                    }
+                    if (s->qmi_spi_addr_len == 3) {
+                        uint32_t off =
+                            ((uint32_t)s->qmi_spi_addr[0] << 16) |
+                            ((uint32_t)s->qmi_spi_addr[1] <<  8) |
+                             (uint32_t)s->qmi_spi_addr[2];
+                        uint8_t *fp = memory_region_get_ram_ptr(&s->flash);
+
+                        if (s->qmi_spi_cmd == 0x20) {
+                            /* Sector erase: fill 4 KB with 0xFF */
+                            uint32_t base = off & ~0xFFFu;
+                            if (base + 4096 <= RP2350_FLASH_SIZE) {
+                                memset(fp + base, 0xFF, 4096);
+                            }
+                            s->qmi_spi_cmd = 0;
+                        } else if (s->qmi_spi_cmd == 0xD8) {
+                            /* Block erase: fill 64 KB with 0xFF */
+                            uint32_t base = off & ~0xFFFFu;
+                            if (base + 65536 <= RP2350_FLASH_SIZE) {
+                                memset(fp + base, 0xFF, 65536);
+                            }
+                            s->qmi_spi_cmd = 0;
+                        } else {
+                            /* Page Program: enter data phase. */
+                            s->qmi_spi_pp_off  = off;
+                            s->qmi_spi_pp_cnt  = 0;
+                            s->qmi_spi_in_data = true;
+                        }
+                    }
+                }
+            }
+
+            /* Each TX FIFO entry with NOPUSH=0 contributes one RX byte. */
+            if (!nopush) {
                 s->qmi_rx_count++;
             }
         }
