@@ -216,6 +216,8 @@ struct RP2350MachineState {
     uint32_t usb_main_ctrl;
     uint32_t usb_sie_status;    /* RW1C */
     uint32_t usb_buff_status;   /* RW1C */
+    uint32_t usb_ep_abort;      /* mirrors EP_ABORT; returned by EP_ABORT_DONE (instant) */
+    uint32_t usb_frame_num;     /* SOF frame counter incremented each 1ms tick */
     uint32_t usb_inte;
     uint32_t usb_intr;
     qemu_irq usb_irq;
@@ -1159,6 +1161,7 @@ static void rp2350_sau_reset(void *opaque)
 #define USB_REG_BUFF_STATUS 0x058u   /* RW1C: bit N = EP(N/2) IN (even) or OUT (odd)   */
 #define USB_REG_EP_ABORT    0x060u
 #define USB_REG_EP_ABTDONE  0x064u
+#define USB_REG_SOF_RD      0x048u   /* RO: current SOF frame number */
 #define USB_REG_INTR        0x08Cu   /* RO: bit16=SETUP_REQ,13=CONN_DIS,12=BUS_RESET,4=BUFF */
 #define USB_REG_INTE        0x090u   /* RW: interrupt enable */
 #define USB_REG_INTF        0x094u   /* RW: interrupt force  */
@@ -1174,6 +1177,7 @@ static void rp2350_sau_reset(void *opaque)
 #define USB_INTR_BUS_RESET  (1u << 12)
 #define USB_INTR_CONN_DIS   (1u << 13)
 #define USB_INTR_SETUP_REQ  (1u << 16)
+#define USB_INTR_SOF        (1u << 17)  /* Start-of-Frame: fires every 1ms */
 
 /* DPRAM offsets (from 0x50100000) */
 #define DPRAM_SETUP_PKT     0x000u   /* 8 bytes: SETUP packet data              */
@@ -1314,7 +1318,9 @@ static void usb_dpram_write(void *opaque, hwaddr addr, uint64_t val, unsigned si
     if (addr == 0x080)
         qemu_log("dpram_wr[0x080]=0x%llx (EP0_IN buf_ctrl) state=%d buff=0x%x\n",
                  (unsigned long long)val, s->usb_state, s->usb_buff_status);
-    if (addr == 0x080 && val != 0 && !(s->usb_buff_status & 0x1u) &&
+    /* Trigger only when AVAIL is set (second write of hw_endpoint_xfer_start).
+     * Triggering on the first write (before AVAIL) would race with the ISR. */
+    if (addr == 0x080 && (val & BUF_CTRL_AVAIL) && !(s->usb_buff_status & 0x1u) &&
         (s->usb_state == USB_ST_ADDR_STATUS ||
          s->usb_state == USB_ST_CFG_STATUS  ||
          s->usb_state == USB_ST_LST_STATUS)) {
@@ -1371,21 +1377,17 @@ static void usb_timer_cb(void *opaque)
         break;
 
     /*
-     * STATUS-phase states.
-     *
-     * For ADDR_STATUS: inject BUFF_STATUS.EP0_IN through the ISR (works
-     * because the USB ISR is not blocked by HardFault at this stage).
-     *
-     * For CFG_STATUS and LST_STATUS: tud_task's tud_control_status() call
-     * panics via hard_assert() inside _hw_endpoint_buffer_control_update32
-     * (reads CPUID 3× then BKPT), causing HardFault that blocks the USB ISR.
-     * dcd_edpt0_status_complete() for SET_CONFIGURATION and CDC_LINE_STATE
-     * does nothing at the DCD level, so we can safely skip the BUFF_STATUS
-     * ISR and advance the state directly once DPRAM[0x080] FULL bit is set
-     * (ep->active=true).  The next SETUP will call reset_ep0() which aborts
-     * any pending EP0 IN transfer automatically.
+     * STATUS-phase states: all three use the same BUFF_STATUS.EP0_IN injection
+     * path.  The previous emulator had a workaround for CFG_STATUS/LST_STATUS
+     * that bypassed this injection because _hw_endpoint_buffer_control_update32
+     * panicked (reading CPUID incorrectly).  With the CPUID SIO stub, correct
+     * VTOR, and proper vector table all in place, the HardFault no longer
+     * occurs and the full ISR path is needed so that tud_control_complete()
+     * fires to set up CDC interfaces after SET_CONFIGURATION.
      */
-    case USB_ST_ADDR_STATUS: {
+    case USB_ST_ADDR_STATUS:
+    case USB_ST_CFG_STATUS:
+    case USB_ST_LST_STATUS: {
         uint32_t ep0_in_bc = 0;
         memcpy(&ep0_in_bc, s->usb_dpram_buf + 0x080, 4);
         bool ep0_in_ready = (ep0_in_bc & 0x8000u) != 0;  /* FULL bit = ep->active */
@@ -1394,45 +1396,15 @@ static void usb_timer_cb(void *opaque)
             usb_update_irq(s);
             timer_mod(s->usb_timer, now + 200);
         } else if (ep0_in_ready) {
+            /* Clear AVAIL from EP0 IN buf_ctrl — real hardware clears it when
+             * the controller consumes the buffer, before BUFF_STATUS fires. */
+            ep0_in_bc &= ~BUF_CTRL_AVAIL;
+            memcpy(s->usb_dpram_buf + 0x080, &ep0_in_bc, 4);
             s->usb_buff_status |= 0x1u;
             qemu_log("usb_timer: inject BUFF EP0_IN state=%d (ep0bc=0x%x)\n",
                      s->usb_state, ep0_in_bc);
             usb_update_irq(s);
             timer_mod(s->usb_timer, now + 200);
-        } else {
-            qemu_log("usb_timer: ep0_in not ready (bc=0x%x) state=%d, retry\n",
-                     ep0_in_bc, s->usb_state);
-            timer_mod(s->usb_timer, now + 5000);
-        }
-        break;
-    }
-
-    case USB_ST_CFG_STATUS:
-    case USB_ST_LST_STATUS: {
-        /*
-         * HardFault blocks the USB ISR, so we can't use BUFF_STATUS injection
-         * here. Instead, wait for DPRAM[0x080] FULL bit (ep->active=true) and
-         * then advance the state directly, simulating STATUS completion without
-         * the ISR.  dcd_edpt0_status_complete does nothing for these requests
-         * so skipping it is safe.
-         */
-        uint32_t ep0_in_bc = 0;
-        memcpy(&ep0_in_bc, s->usb_dpram_buf + 0x080, 4);
-        if (ep0_in_bc & 0x8000u) {
-            /* ep->active=true: STATUS phase is set up. Advance directly. */
-            qemu_log("usb_timer: direct advance state=%d (ep0bc=0x%x) skip BUFF ISR\n",
-                     s->usb_state, ep0_in_bc);
-            /* Clear buf_ctrl so reset_ep0 in next SETUP doesn't see stale FULL */
-            uint32_t zero = 0;
-            memcpy(s->usb_dpram_buf + 0x080, &zero, 4);
-            /* Advance state machine as if BUFF_STATUS W1C happened */
-            if (s->usb_state == USB_ST_CFG_STATUS) {
-                s->usb_state = USB_ST_CDC_LST;
-                timer_mod(s->usb_timer, now + 5000);
-            } else {
-                s->usb_state = USB_ST_RUNNING;
-                timer_mod(s->usb_timer, now + 1000);
-            }
         } else {
             qemu_log("usb_timer: ep0_in not ready (bc=0x%x) state=%d, retry\n",
                      ep0_in_bc, s->usb_state);
@@ -1462,6 +1434,15 @@ static void usb_timer_cb(void *opaque)
         break;
 
     case USB_ST_RUNNING: {
+        /* Fire a SOF interrupt every 1ms tick.  Real USB FS hardware generates
+         * SOF tokens at 1 kHz.  tinyUSB's CDC driver flushes its TX FIFO in the
+         * SOF callback (cdcd_sof), so without SOF the REPL banner never appears. */
+        s->usb_frame_num = (s->usb_frame_num + 1) & 0x7FFu;
+        if (s->usb_inte & USB_INTR_SOF) {
+            s->usb_intr |= USB_INTR_SOF;
+            usb_update_irq(s);
+        }
+
         /*
          * Scan DPRAM buffer control region 0x080-0x0B0 (EP0-EP5 IN/OUT).
          * Also dump EP ctrl regs 0x100-0x110 (EP1-EP2 IN/OUT) and
@@ -1535,6 +1516,7 @@ static uint64_t usb_reg_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (reg) {
     case USB_REG_MAIN_CTRL:   val = s->usb_main_ctrl; break;
+    case USB_REG_SOF_RD:      val = s->usb_frame_num; break;
     case USB_REG_SIE_CTRL:    val = 0x00008000u; break;  /* PULLDOWN_EN reset */
     case USB_REG_SIE_STATUS:
         val = s->usb_sie_status;
@@ -1545,6 +1527,12 @@ static uint64_t usb_reg_read(void *opaque, hwaddr addr, unsigned size)
         val = s->usb_buff_status;
         qemu_log("usb_buff_read: buff=0x%x state=%d\n", val, s->usb_state);
         break;
+    case USB_REG_EP_ABORT:    val = s->usb_ep_abort; break;
+    case USB_REG_EP_ABTDONE:
+        /* Simulate instant abort completion: return same bits as EP_ABORT. */
+        val = s->usb_ep_abort;
+        qemu_log("usb_ep_abtdone_read: val=0x%x state=%d\n", val, s->usb_state);
+        break;
     case USB_REG_INTR:
         val = s->usb_intr;
         qemu_log("usb_intr_read: intr=0x%x state=%d\n", val, s->usb_state);
@@ -1553,6 +1541,12 @@ static uint64_t usb_reg_read(void *opaque, hwaddr addr, unsigned size)
     case USB_REG_INTS:
         val = (s->usb_intr | (s->usb_buff_status ? USB_INTR_BUFF : 0))
               & s->usb_inte;
+        /* SOF is level-sensitive on real hardware: auto-clear after ISR reads INTS
+         * so the while-loop in dcd_rp2040_irq exits rather than spinning. */
+        if (s->usb_intr & USB_INTR_SOF) {
+            s->usb_intr &= ~USB_INTR_SOF;
+            usb_update_irq(s);
+        }
         qemu_log("usb_ints_read: ints=0x%x state=%d intr=0x%x\n",
                  val, s->usb_state, s->usb_intr);
         break;
@@ -1640,6 +1634,35 @@ static void usb_reg_write(void *opaque, hwaddr addr, uint64_t data, unsigned siz
                 timer_mod(s->usb_timer, now + 1000);
             }
         }
+        return;
+    }
+
+    if (reg == USB_REG_EP_ABORT) {
+        uint32_t old = s->usb_ep_abort;
+        switch (alias) {
+        case 0: s->usb_ep_abort  = (uint32_t)data; break;
+        case 1: s->usb_ep_abort ^= (uint32_t)data; break;
+        case 2: s->usb_ep_abort |= (uint32_t)data; break;
+        case 3: s->usb_ep_abort &= ~(uint32_t)data; break;
+        }
+        /* For each newly aborted endpoint, clear AVAIL from its buf_ctrl in DPRAM.
+         * Real hardware clears AVAIL on abort, preventing the assert in
+         * _hw_endpoint_buffer_control_update32 when the next xfer is set up. */
+        uint32_t newly_set = s->usb_ep_abort & ~old;
+        for (uint32_t bit = 0; bit < 32; bit++) {
+            if (newly_set & (1u << bit)) {
+                uint32_t bc_off = 0x080 + bit * 4;
+                if (bc_off + 4 <= sizeof(s->usb_dpram_buf)) {
+                    uint32_t bc;
+                    memcpy(&bc, s->usb_dpram_buf + bc_off, 4);
+                    bc &= ~BUF_CTRL_AVAIL;
+                    memcpy(s->usb_dpram_buf + bc_off, &bc, 4);
+                    qemu_log("usb_ep_abort: bit=%u bc_off=0x%03x cleared AVAIL\n", bit, bc_off);
+                }
+            }
+        }
+        qemu_log("usb_ep_abort_write: alias=%d data=0x%x now=0x%x state=%d\n",
+                 alias, (uint32_t)data, s->usb_ep_abort, s->usb_state);
         return;
     }
 
